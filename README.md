@@ -4,6 +4,8 @@ Enki custom component for Home Assistant
 
 Tested devices:
 - Eglo V-link tunable white
+- Inspire Radix ceiling fan with light
+- NEW! Solar Panels by Envertech-Lexman
 - Inspire Cadix ceiling fan with light
 
 Howto :
