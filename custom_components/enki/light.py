@@ -4,21 +4,22 @@ from typing import Optional
 from typing import Any
 
 from homeassistant.components.light import ColorMode, LightEntity
-from homeassistant.components.light.const import DEFAULT_MIN_KELVIN, DEFAULT_MAX_KELVIN 
+from homeassistant.components.light.const import DEFAULT_MIN_KELVIN, DEFAULT_MAX_KELVIN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import EnkiConfigEntry
 from .base import EnkiBaseEntity
 from .coordinator import EnkiCoordinator
-from .const import LOGGER
+from .const import CEILING_FAN_MOTOR_ENDPOINT, LOGGER
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: EnkiConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ):
-    """Set up the Binary Sensors."""
+    """Set up light entities."""
     coordinator: EnkiCoordinator = config_entry.runtime_data.coordinator
 
     lights = [
@@ -28,13 +29,15 @@ async def async_setup_entry(
     ]
     async_add_entities(lights)
 
+
 class EnkiLight(EnkiBaseEntity, LightEntity):
-    """Implementation of an light depending on its capabilities."""
+    """Implementation of a light depending on its capabilities."""
+
     _attr_supported_color_modes = set()
     _attr_color_mode = None
     _attr_min_color_temp_kelvin = None
     _attr_max_color_temp_kelvin = None
-    BRIGHTNESS_SCALE = (1,255)
+    BRIGHTNESS_SCALE = (1, 255)
 
     def __init__(
         self,
@@ -49,25 +52,21 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         self._endpoint_id = endpoint_id
         self._color_temp_values = []
         self.parameter = parameter
-        self._attr_supported_color_modes = set()  # instance-level to avoid class mutation
+        self._attr_supported_color_modes = set()
         self._attr_color_mode = None
 
         capabilities = _capabilities_set(device)
-
-        # Some devices (e.g. Edisio Wi-Fi plugs/outlets) only expose
-        # switch_electrical_power / check_electrical_power and do not support
-        # change_light_state / check_light_state at all. For those devices we
-        # must use the power API (switch_electrical_power) instead of the
-        # lighting API (change_light_state) to change or read their state.
         self._supports_light_state = bool(
             {"change_light_state", "check_light_state"} & capabilities
         )
+        self._power_channel = _power_channel_for_endpoint(device, endpoint_id)
+        self._use_channel_power = _device_supports_channel_power(device) and self._power_channel is not None
 
         if "possibleValues" in device and "change_brightness" in device["possibleValues"]:
             min_value = device["possibleValues"]["change_brightness"]["range"]["min"]
             max_value = device["possibleValues"]["change_brightness"]["range"]["max"]
-            LOGGER.debug("brightness min : " + str(min_value))
-            LOGGER.debug("brightness max : " + str(max_value))
+            LOGGER.debug("brightness min : %s", min_value)
+            LOGGER.debug("brightness max : %s", max_value)
             self.BRIGHTNESS_SCALE = (min_value, max_value)
 
         if "change_color_temperature" in capabilities:
@@ -77,13 +76,13 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
                 values = device["possibleValues"]["change_color_temperature"]["values"]
                 min_value = int(values[0][1:-1])
                 max_value = int(values[-1][1:-1])
-                self._attr_min_color_temp_kelvin=min_value
-                self._attr_max_color_temp_kelvin=max_value
+                self._attr_min_color_temp_kelvin = min_value
+                self._attr_max_color_temp_kelvin = max_value
                 for val in values:
                     self._color_temp_values.append(int(val[1:-1]))
             else:
-                self._attr_min_color_temp_kelvin=DEFAULT_MIN_KELVIN
-                self._attr_max_color_temp_kelvin=DEFAULT_MAX_KELVIN
+                self._attr_min_color_temp_kelvin = DEFAULT_MIN_KELVIN
+                self._attr_max_color_temp_kelvin = DEFAULT_MAX_KELVIN
 
         if "change_brightness" in capabilities:
             if len(self._attr_supported_color_modes) == 0:
@@ -101,7 +100,7 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
 
     @property
     def is_on(self) -> bool | None:
-        """Return if the binary sensor is on."""
+        """Return if the light is on."""
         if self._endpoint_id is not None:
             endpoints = self.coordinator.get_device_parameter(self.node_id, "electricalEndpoints")
             if isinstance(endpoints, list):
@@ -116,16 +115,12 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
                             power = endpoint_lrv.get("power")
                             return power == "ON" if power is not None else None
 
-        # Fallback for devices without per-endpoint status shape.
         last_reported_values = self.coordinator.get_device_parameter(self.node_id, "lastReportedValue")
         if isinstance(last_reported_values, dict):
             power = last_reported_values.get("power")
             if power is not None:
                 return power == "ON"
 
-        # Fallback for pure switch/outlet devices (e.g. Edisio Wi-Fi plugs)
-        # that report their state via switch_electrical_power /
-        # check_electrical_power instead of change_light_state.
         electrical_power = self.coordinator.get_device_parameter(self.node_id, "electricalPower")
         if isinstance(electrical_power, str) and electrical_power in ("ON", "OFF"):
             return electrical_power == "ON"
@@ -133,87 +128,42 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         return None
 
     def closest_temp_value(self, target_value):
-        return min(self._color_temp_values, key=lambda x: abs(x - target_value)) 
+        return min(self._color_temp_values, key=lambda x: abs(x - target_value))
 
     def _light_endpoint_ids(self) -> list[int]:
         """Return endpoint ids used by light entities on this device."""
-        return _main_change_capability_endpoint_ids(self._device)
-
-    def _light_endpoints_have_mixed_power(self) -> bool:
-        """Return True when at least one light endpoint is ON and another is OFF."""
-        endpoint_ids = self._light_endpoint_ids()
-        if len(endpoint_ids) <= 1:
-            return False
-
-        endpoints = self.coordinator.get_device_parameter(self.node_id, "electricalEndpoints")
-        if not isinstance(endpoints, list):
-            return False
-
-        power_values: set[str] = set()
-        for endpoint in endpoints:
-            if not isinstance(endpoint, dict):
-                continue
-            endpoint_id = endpoint.get("id")
-            if endpoint_id not in endpoint_ids:
-                continue
-
-            last_reported_value = endpoint.get("lastReportedValue")
-            if isinstance(last_reported_value, str) and last_reported_value in {"ON", "OFF"}:
-                power_values.add(last_reported_value)
-            elif isinstance(last_reported_value, dict):
-                power = last_reported_value.get("power")
-                if power in {"ON", "OFF"}:
-                    power_values.add(power)
-
-            if len(power_values) > 1:
-                return True
-
-        return False
-
-    def update_data_power_light_endpoints(self, power: str) -> None:
-        """Apply optimistic power to known light endpoints in coordinator cache."""
-        for endpoint_id in self._light_endpoint_ids():
-            self.coordinator.update_endpoint_power(self.node_id, endpoint_id, power)
-
-    async def _mixed_endpoint_workaround(self) -> None:
-        """Send OFF first when needed to force a fresh ON transition for all lights."""
-        if self._light_endpoints_have_mixed_power():
-            await self.coordinator.api.change_light_state(
-                self._device["homeId"],
-                self._device["nodeId"],
-                {"power": "OFF"},
-            )
+        return _light_endpoint_ids(self._device)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
         if not self._supports_light_state:
-            # Pure switch/outlet devices (e.g. Edisio Wi-Fi plugs) do not
-            # support change_light_state/check_light_state. Use the power
-            # API (switch_electrical_power) instead of the lighting API.
             await self.coordinator.api.switch_electrical_power(
                 self._device["homeId"], self._device["nodeId"], "ON"
             )
             self.coordinator.update_data(self.node_id, None, "electricalPower", "ON")
             return
 
-        # TODO: switch_electrical_power turns on ALL endpoints of the device (lights, fan, etc).
-        # Until the API supports per-endpoint control without side-effects, use change_light_state
-        # for all light entities regardless of whether they have an endpoint_id. This will turn on
-        # all the lights but at least will not turn on the fan or other non-light endpoints.
-        # Additional workaround: if the light endpoints are in mixed state (one ON, another OFF),
-        # force an OFF->ON transition so turn_on is not ignored when global power is already ON.
-        await self._mixed_endpoint_workaround()
+        if self._use_channel_power and "brightness" not in kwargs and "color_temp_kelvin" not in kwargs:
+            await self.coordinator.api.switch_channel_electrical_power(
+                self._device["homeId"],
+                self._device["nodeId"],
+                self._power_channel,
+                "ON",
+            )
+            if self._endpoint_id is not None:
+                self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, "ON")
+            return
 
         changes: dict[str, Any] = {"power": "ON"}
         if "brightness" in kwargs:
             ha_value = kwargs["brightness"]
-            changes["brightness"] = round(ha_value / (255/self.BRIGHTNESS_SCALE[1]), 2)
-            LOGGER.debug(f"setting brightness value to {ha_value} => {changes['brightness']}")
+            changes["brightness"] = round(ha_value / (255 / self.BRIGHTNESS_SCALE[1]), 2)
+            LOGGER.debug("setting brightness value to %s => %s", ha_value, changes["brightness"])
 
         if "color_temp_kelvin" in kwargs:
             ha_value = kwargs["color_temp_kelvin"]
             value = self.closest_temp_value(ha_value)
-            LOGGER.debug("setting color temp to closest value : " + str(ha_value) + " => " + str(value))
+            LOGGER.debug("setting color temp to closest value : %s => %s", ha_value, value)
             changes["colorTemperature"] = "T" + str(value) + "K"
 
         await self.coordinator.api.change_light_state(
@@ -222,45 +172,59 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
             changes,
         )
 
-        self.update_data_power_light_endpoints("ON")
-        self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "ON")        
+        if self._endpoint_id is None:
+            self._optimistic_update_all_light_endpoints("ON")
+        self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "ON")
         if "brightness" in changes:
             self.coordinator.update_data(self.node_id, "lastReportedValue", "brightness", changes["brightness"])
         if "colorTemperature" in changes:
-            self.coordinator.update_data(self.node_id, "lastReportedValue", "colorTemperature", changes["colorTemperature"])
+            self.coordinator.update_data(
+                self.node_id, "lastReportedValue", "colorTemperature", changes["colorTemperature"]
+            )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
         if not self._supports_light_state:
-            # See async_turn_on: pure switch/outlet devices use the power API.
             await self.coordinator.api.switch_electrical_power(
                 self._device["homeId"], self._device["nodeId"], "OFF"
             )
             self.coordinator.update_data(self.node_id, None, "electricalPower", "OFF")
             return
 
-        # TODO: switch_electrical_power turns off ALL endpoints of the device (lights, fan, etc).
-        # Until the API supports per-endpoint control without side-effects, use change_light_state
-        # for all light entities regardless of whether they have an endpoint_id. This will turn off
-        # all the lights but at least will not turn off the fan or other non-light endpoints.
-        await self.coordinator.api.change_light_state(self._device["homeId"], self._device["nodeId"], {"power": "OFF"})
+        if self._use_channel_power:
+            await self.coordinator.api.switch_channel_electrical_power(
+                self._device["homeId"],
+                self._device["nodeId"],
+                self._power_channel,
+                "OFF",
+            )
+            if self._endpoint_id is not None:
+                self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, "OFF")
+            return
 
-        self.update_data_power_light_endpoints("OFF")
-        self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "OFF")        
+        await self.coordinator.api.change_light_state(
+            self._device["homeId"], self._device["nodeId"], {"power": "OFF"}
+        )
+        self._optimistic_update_all_light_endpoints("OFF")
+        self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "OFF")
+
+    def _optimistic_update_all_light_endpoints(self, power: str) -> None:
+        for endpoint_id in self._light_endpoint_ids():
+            self.coordinator.update_endpoint_power(self.node_id, endpoint_id, power)
 
     @property
     def brightness(self) -> Optional[int]:
         """Return the current brightness."""
         last_reported_values = self.coordinator.get_device_parameter(self.node_id, "lastReportedValue")
-        if "brightness" not in last_reported_values:
+        if not isinstance(last_reported_values, dict) or "brightness" not in last_reported_values:
             return None
-        return last_reported_values["brightness"]*(255/self.BRIGHTNESS_SCALE[1])
-    
+        return last_reported_values["brightness"] * (255 / self.BRIGHTNESS_SCALE[1])
+
     @property
     def color_temp_kelvin(self) -> int | None:
         """Return the color temperature in Kelvin."""
         last_reported_values = self.coordinator.get_device_parameter(self.node_id, "lastReportedValue")
-        if "colorTemperature" not in last_reported_values:
+        if not isinstance(last_reported_values, dict) or "colorTemperature" not in last_reported_values:
             return None
         return int(last_reported_values["colorTemperature"][1:-1])
 
@@ -268,13 +232,17 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
 def _build_light_entities(coordinator: EnkiCoordinator, device: dict[str, Any]) -> list[LightEntity]:
     """Create light entities from power capability and BFF endpoint metadata."""
     if not _has_switch_electrical_power(device):
-
         return []
 
-    endpoint_ids = _main_change_capability_endpoint_ids(device)
+    endpoint_ids = _light_endpoint_ids(device)
     if endpoint_ids:
         return [
-            EnkiLight(coordinator, device, parameter=f"light_{chr(ord('a') + i)}", endpoint_id=endpoint_id)
+            EnkiLight(
+                coordinator,
+                device,
+                parameter=f"light_{chr(ord('a') + i)}",
+                endpoint_id=endpoint_id,
+            )
             for i, endpoint_id in enumerate(endpoint_ids)
         ]
 
@@ -306,6 +274,38 @@ def _main_change_capability_endpoint_ids(device: dict[str, Any]) -> list[int]:
                 endpoint_ids.add(endpoint_id)
 
     return sorted(endpoint_ids)
+
+
+def _light_endpoint_ids(device: dict[str, Any]) -> list[int]:
+    """Return light endpoint ids, excluding the fan motor on ceiling fans."""
+    endpoint_ids = _main_change_capability_endpoint_ids(device)
+    if device.get("deviceType") == "ceiling_fans":
+        return [endpoint_id for endpoint_id in endpoint_ids if endpoint_id != CEILING_FAN_MOTOR_ENDPOINT]
+    return endpoint_ids
+
+
+def _device_supports_channel_power(device: dict[str, Any]) -> bool:
+    """Return True when per-channel power switching is available."""
+    capabilities = _capabilities_set(device)
+    if {
+        "switch_channel1_electrical_power",
+        "switch_channel2_electrical_power",
+    } & capabilities:
+        return True
+    return device.get("deviceType") == "ceiling_fans" and len(_light_endpoint_ids(device)) >= 2
+
+
+def _power_channel_for_endpoint(device: dict[str, Any], endpoint_id: int | None) -> int | None:
+    """Map a light endpoint id to Enki power channel 1 or 2."""
+    if endpoint_id is None:
+        return None
+    light_ids = _light_endpoint_ids(device)
+    if endpoint_id not in light_ids:
+        return None
+    channel_index = light_ids.index(endpoint_id)
+    if channel_index > 1:
+        return None
+    return channel_index + 1
 
 
 def _capabilities_set(device: dict[str, Any]) -> set[str]:

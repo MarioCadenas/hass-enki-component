@@ -10,6 +10,9 @@ NAME = "Enki"
 
 DEFAULT_SCAN_INTERVAL = 60
 
+# Inspire Cadix/Radix ceiling fans use endpoint 2 for the fan motor.
+CEILING_FAN_MOTOR_ENDPOINT = 2
+
 ENKI_OIDC_URL = "https://keycloak-prod.iot.leroymerlin.fr/realms/enki/protocol/openid-connect/token"
 ENKI_URL = "https://enki.api.devportal.adeo.cloud"
 ENKI_HOME_API_KEY = "FULsxyI3x1f7MtLVOsP6V1DeAPmBQJCB"

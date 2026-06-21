@@ -403,6 +403,39 @@ class API:
             LOGGER.error("Error on power switch. status %s, response %s", resp.status, str(response))
             raise ValueError("bad credentials")
 
+    async def switch_channel_electrical_power(
+        self, home_id: str, node_id: str, channel: int, value: str
+    ) -> None:
+        """Switch one electrical power channel (1 or 2) without affecting the other."""
+        if channel not in (1, 2):
+            raise ValueError(f"Unsupported power channel: {channel}")
+        await self.check_connected()
+        payload = {"value": value}
+        async with aiohttp.ClientSession() as session, session.request(
+            method="POST",
+            url=(
+                f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/"
+                f"switch-channel{channel}-electrical-power"
+            ),
+            headers={
+                "Authorization": f"{self._token_type} {self._access_token}",
+                "homeId": home_id,
+                "X-Gateway-APIKey": ENKI_POWER_API_KEY,
+            },
+            proxy=proxy,
+            json=payload,
+        ) as resp:
+            if resp.status == 202:
+                return
+            response = await resp.text()
+            LOGGER.error(
+                "Error on channel %s power switch. status %s, response %s",
+                channel,
+                resp.status,
+                str(response),
+            )
+            raise ValueError("bad credentials")
+
     async def _change_airflow_value(self, home_id, node_id, endpoint, value):
         """Write airflow value to one change endpoint."""
         await self.check_connected()

@@ -8,6 +8,13 @@ Tested devices:
 - NEW! Solar Panels by Envertech-Lexman
 - Inspire Cadix ceiling fan with light
 
+### Dual-light ceiling fans (Cadix / Radix)
+
+Inspire ceiling fans with two independent lights use Enki's per-channel power API
+(`switch-channel1-electrical-power` / `switch-channel2-electrical-power`) for on/off.
+Brightness and color temperature still use the global lighting API and may affect both lights.
+See `doc/api_rest_reference.md` for API details.
+
 Howto :
 
 - install HACS
