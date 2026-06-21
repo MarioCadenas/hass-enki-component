@@ -6,7 +6,7 @@ LOGGER: Logger = getLogger(__package__)
 # This is the internal name of the integration, it should also match the directory
 # name for the integration.
 DOMAIN = "enki"
-NAME = "Enki"
+NAME = "Enki (Mario)"
 
 DEFAULT_SCAN_INTERVAL = 60
 

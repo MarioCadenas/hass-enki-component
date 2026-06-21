@@ -17,7 +17,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LOGGER
+from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LOGGER, NAME
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -42,7 +42,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     except APIConnectionError as err:
         LOGGER.warning("Enki connection failed for user %s: %s", data[CONF_USERNAME], err)
         raise CannotConnect from err
-    return {"title": f"Enki - {data[CONF_USERNAME]}"}
+    return {"title": f"{NAME} - {data[CONF_USERNAME]}"}
 
 
 class EnkiConfigFlow(ConfigFlow, domain=DOMAIN):

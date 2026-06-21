@@ -1,4 +1,6 @@
-# hass-enki-component
+# Enki (Mario) — Home Assistant custom component
+
+Fork of [CyrilP/hass-enki-component](https://github.com/CyrilP/hass-enki-component) with dual-light ceiling fan fixes.
 
 Enki custom component for Home Assistant
 
