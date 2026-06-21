@@ -23,6 +23,22 @@ from .const import (
 
 proxy = None
 
+POST_SUCCESS_STATUSES = {200, 202, 204}
+
+
+def _post_succeeded(status: int) -> bool:
+    return status in POST_SUCCESS_STATUSES
+
+
+class APICommandError(Exception):
+    """Raised when an Enki command endpoint returns an error."""
+
+    def __init__(self, action: str, status: int, response: str) -> None:
+        self.action = action
+        self.status = status
+        self.response = response
+        super().__init__(f"Enki {action} failed ({status}): {response}")
+
 @dataclass
 class Device:
     """API device."""
@@ -194,6 +210,10 @@ class API:
                 "electricalPower": power_details.get("lastReportedValue"),
                 "electricalEndpoints": power_details.get("endpoints", []),
             })
+            if device.get("deviceType") == "ceiling_fans":
+                device["supportsChannelPower"] = await self.check_channel_power_available(
+                    device.get("homeId"), device.get("nodeId")
+                )
 
         if _supports_fan_speed(capabilities, possible_values):
             fan_speed = await self.get_fan_speed(device.get("homeId"), device.get("nodeId"))
@@ -288,10 +308,11 @@ class API:
 
     async def change_light_state(self, home_id, node_id, changes: dict):
         await self.check_connected()
-        
-        data = (await self.get_light_details(home_id, node_id))["lastReportedValue"]
+
+        details = await self.get_light_details(home_id, node_id)
+        data = dict(details.get("lastReportedValue") or {})
         data.update(changes)
-        
+
         async with aiohttp.ClientSession() as session, session.request(
             method="POST",
             url=f"{ENKI_URL}/api-enki-lighting-prod/v1/lighting/{node_id}/change-light-state",
@@ -301,11 +322,11 @@ class API:
             proxy=proxy,
             json=data) as resp:
 
-                if resp.status != 202:
-                    response = await resp.text()
-                    LOGGER.debug(resp.status)
-                    LOGGER.error("Error on change_light_state. status %s, response %s", resp.status, str(response))
-                    raise ValueError("bad credentials")
+                if _post_succeeded(resp.status):
+                    return
+                response = await resp.text()
+                LOGGER.error("Error on change_light_state. status %s, response %s", resp.status, str(response))
+                raise APICommandError("change_light_state", resp.status, response)
 
     async def _check_airflow_value(self, home_id, node_id, endpoint):
         """Read airflow value from one check endpoint."""
@@ -384,7 +405,7 @@ class API:
             proxy=proxy,
             json=payload,
         ) as resp:
-            if resp.status == 202:
+            if _post_succeeded(resp.status):
                 if LOGGER.isEnabledFor(logging.DEBUG):
                     try:
                         after_state = await self.get_electrical_power_details(home_id, node_id)
@@ -401,40 +422,83 @@ class API:
 
             response = await resp.text()
             LOGGER.error("Error on power switch. status %s, response %s", resp.status, str(response))
-            raise ValueError("bad credentials")
+            raise APICommandError("switch_electrical_power", resp.status, response)
+
+    async def check_channel_power_available(self, home_id: str, node_id: str) -> bool:
+        """Return True when channel-specific power endpoints respond."""
+        await self.check_connected()
+        headers = {
+            "Authorization": f"{self._token_type} {self._access_token}",
+            "homeId": home_id,
+            "X-Gateway-APIKey": ENKI_POWER_API_KEY,
+        }
+        async with aiohttp.ClientSession() as session, session.request(
+            method="GET",
+            url=f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/check-channel1-electrical-power",
+            headers=headers,
+            proxy=proxy,
+        ) as resp:
+            return resp.status == 200
 
     async def switch_channel_electrical_power(
-        self, home_id: str, node_id: str, channel: int, value: str
+        self, home_id: str, node_id: str, channel: int, value: str, endpoint_id: int | None = None
     ) -> None:
-        """Switch one electrical power channel (1 or 2) without affecting the other."""
+        """Switch one electrical power channel without affecting the other when supported."""
         if channel not in (1, 2):
             raise ValueError(f"Unsupported power channel: {channel}")
         await self.check_connected()
-        payload = {"value": value}
-        async with aiohttp.ClientSession() as session, session.request(
-            method="POST",
-            url=(
-                f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/"
-                f"switch-channel{channel}-electrical-power"
+
+        headers = {
+            "Authorization": f"{self._token_type} {self._access_token}",
+            "homeId": home_id,
+            "X-Gateway-APIKey": ENKI_POWER_API_KEY,
+            "Content-Type": "application/json",
+        }
+        attempts: list[tuple[str, dict[str, Any]]] = [
+            (
+                f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/switch-channel{channel}-electrical-power",
+                {"value": value},
             ),
-            headers={
-                "Authorization": f"{self._token_type} {self._access_token}",
-                "homeId": home_id,
-                "X-Gateway-APIKey": ENKI_POWER_API_KEY,
-            },
-            proxy=proxy,
-            json=payload,
-        ) as resp:
-            if resp.status == 202:
-                return
-            response = await resp.text()
-            LOGGER.error(
-                "Error on channel %s power switch. status %s, response %s",
-                channel,
-                resp.status,
-                str(response),
+        ]
+        if endpoint_id is not None:
+            attempts.extend(
+                [
+                    (
+                        f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/switch-electrical-power",
+                        {"value": value, "endpointId": endpoint_id},
+                    ),
+                    (
+                        f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/switch-electrical-power",
+                        {"value": value, "id": endpoint_id},
+                    ),
+                ]
             )
-            raise ValueError("bad credentials")
+
+        errors: list[str] = []
+        async with aiohttp.ClientSession() as session:
+            for url, payload in attempts:
+                async with session.request(
+                    method="POST",
+                    url=url,
+                    headers=headers,
+                    proxy=proxy,
+                    json=payload,
+                ) as resp:
+                    if _post_succeeded(resp.status):
+                        LOGGER.debug(
+                            "Light endpoint power switch succeeded via %s payload=%s",
+                            url,
+                            payload,
+                        )
+                        return
+                    response = await resp.text()
+                    errors.append(f"{url} -> {resp.status}: {response}")
+
+        raise APICommandError(
+            f"switch_channel{channel}_electrical_power",
+            0,
+            " | ".join(errors),
+        )
 
     async def _change_airflow_value(self, home_id, node_id, endpoint, value):
         """Write airflow value to one change endpoint."""
