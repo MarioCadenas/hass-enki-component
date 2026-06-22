@@ -211,9 +211,9 @@ class API:
                 "electricalEndpoints": power_details.get("endpoints", []),
             })
             if device.get("deviceType") == "ceiling_fans":
-                device["supportsChannelPower"] = await self.check_channel_power_available(
-                    device.get("homeId"), device.get("nodeId")
-                )
+                device["supportsEndpointPower"] = len(
+                    device.get("electricalEndpoints") or []
+                ) > 1
 
         if _supports_fan_speed(capabilities, possible_values):
             fan_speed = await self.get_fan_speed(device.get("homeId"), device.get("nodeId"))
@@ -423,6 +423,47 @@ class API:
             response = await resp.text()
             LOGGER.error("Error on power switch. status %s, response %s", resp.status, str(response))
             raise APICommandError("switch_electrical_power", resp.status, response)
+
+    async def switch_endpoint_electrical_power(
+        self, home_id: str, node_id: str, endpoint_id: int, value: str
+    ) -> None:
+        """Switch one electrical endpoint (e.g. Cadix light 1 or 3) without affecting others."""
+        await self.check_connected()
+        async with aiohttp.ClientSession() as session, session.request(
+            method="POST",
+            url=(
+                f"{ENKI_URL}/api-enki-power-prod/v1/power/{node_id}/"
+                f"switch-electrical-power?endpoints={endpoint_id}"
+            ),
+            headers={
+                "Authorization": f"{self._token_type} {self._access_token}",
+                "homeId": home_id,
+                "X-Gateway-APIKey": ENKI_POWER_API_KEY,
+                "Content-Type": "application/json",
+            },
+            proxy=proxy,
+            json={"value": value},
+        ) as resp:
+            if _post_succeeded(resp.status):
+                LOGGER.debug(
+                    "switch-electrical-power endpoint %s -> %s on node %s",
+                    endpoint_id,
+                    value,
+                    node_id,
+                )
+                return
+            response = await resp.text()
+            LOGGER.error(
+                "Error on endpoint %s power switch. status %s, response %s",
+                endpoint_id,
+                resp.status,
+                str(response),
+            )
+            raise APICommandError(
+                f"switch_endpoint_electrical_power({endpoint_id})",
+                resp.status,
+                response,
+            )
 
     async def check_channel_power_available(self, home_id: str, node_id: str) -> bool:
         """Return True when channel-specific power endpoints respond."""

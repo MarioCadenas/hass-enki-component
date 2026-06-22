@@ -12,8 +12,10 @@ Tested devices:
 
 ### Dual-light ceiling fans (Cadix / Radix)
 
-Inspire ceiling fans with two independent lights use Enki's per-channel power API
-(`switch-channel1-electrical-power` / `switch-channel2-electrical-power`) for on/off.
+Inspire ceiling fans with two independent lights use Enki's per-endpoint power API:
+
+`POST /power/{nodeId}/switch-electrical-power?endpoints={endpointId}`
+
 Brightness and color temperature still use the global lighting API and may affect both lights.
 See `doc/api_rest_reference.md` for API details.
 

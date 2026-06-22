@@ -12,7 +12,6 @@ from . import EnkiConfigEntry
 from .base import EnkiBaseEntity
 from .coordinator import EnkiCoordinator
 from .const import CEILING_FAN_MOTOR_ENDPOINT, LOGGER
-from .api import APICommandError
 
 
 async def async_setup_entry(
@@ -60,8 +59,7 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         self._supports_light_state = bool(
             {"change_light_state", "check_light_state"} & capabilities
         )
-        self._power_channel = _power_channel_for_endpoint(device, endpoint_id)
-        self._use_channel_power = _device_supports_channel_power(device) and self._power_channel is not None
+        self._use_endpoint_power = _use_endpoint_power_switch(device, endpoint_id)
 
         if "possibleValues" in device and "change_brightness" in device["possibleValues"]:
             min_value = device["possibleValues"]["change_brightness"]["range"]["min"]
@@ -131,9 +129,15 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
     def closest_temp_value(self, target_value):
         return min(self._color_temp_values, key=lambda x: abs(x - target_value))
 
-    def _light_endpoint_ids(self) -> list[int]:
-        """Return endpoint ids used by light entities on this device."""
-        return _light_endpoint_ids(self._device)
+    async def _switch_endpoint_power(self, value: str) -> None:
+        """Toggle one light endpoint via power API (?endpoints= query param)."""
+        await self.coordinator.api.switch_endpoint_electrical_power(
+            self._device["homeId"],
+            self._device["nodeId"],
+            self._endpoint_id,
+            value,
+        )
+        self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, value)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
@@ -144,24 +148,10 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
             self.coordinator.update_data(self.node_id, None, "electricalPower", "ON")
             return
 
-        if self._use_channel_power and "brightness" not in kwargs and "color_temp_kelvin" not in kwargs:
-            try:
-                await self.coordinator.api.switch_channel_electrical_power(
-                    self._device["homeId"],
-                    self._device["nodeId"],
-                    self._power_channel,
-                    "ON",
-                    self._endpoint_id,
-                )
-                if self._endpoint_id is not None:
-                    self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, "ON")
-                return
-            except APICommandError as err:
-                LOGGER.warning(
-                    "Per-channel light ON failed for endpoint %s, using global lighting API: %s",
-                    self._endpoint_id,
-                    err,
-                )
+        # Per-endpoint on/off for dual-light ceiling fans (Cadix, Radix, …).
+        if self._use_endpoint_power and "brightness" not in kwargs and "color_temp_kelvin" not in kwargs:
+            await self._switch_endpoint_power("ON")
+            return
 
         changes: dict[str, Any] = {"power": "ON"}
         if "brightness" in kwargs:
@@ -175,6 +165,7 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
             LOGGER.debug("setting color temp to closest value : %s => %s", ha_value, value)
             changes["colorTemperature"] = "T" + str(value) + "K"
 
+        # Brightness/color still use the global lighting API (may affect all lights).
         await self.coordinator.api.change_light_state(
             self._device["homeId"],
             self._device["nodeId"],
@@ -182,7 +173,10 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
         )
 
         if self._endpoint_id is None:
-            self._optimistic_update_all_light_endpoints("ON")
+            for endpoint_id in _light_endpoint_ids(self._device):
+                self.coordinator.update_endpoint_power(self.node_id, endpoint_id, "ON")
+        elif self._endpoint_id is not None:
+            self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, "ON")
         self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "ON")
         if "brightness" in changes:
             self.coordinator.update_data(self.node_id, "lastReportedValue", "brightness", changes["brightness"])
@@ -200,34 +194,16 @@ class EnkiLight(EnkiBaseEntity, LightEntity):
             self.coordinator.update_data(self.node_id, None, "electricalPower", "OFF")
             return
 
-        if self._use_channel_power:
-            try:
-                await self.coordinator.api.switch_channel_electrical_power(
-                    self._device["homeId"],
-                    self._device["nodeId"],
-                    self._power_channel,
-                    "OFF",
-                    self._endpoint_id,
-                )
-                if self._endpoint_id is not None:
-                    self.coordinator.update_endpoint_power(self.node_id, self._endpoint_id, "OFF")
-                return
-            except APICommandError as err:
-                LOGGER.warning(
-                    "Per-channel light OFF failed for endpoint %s, using global lighting API: %s",
-                    self._endpoint_id,
-                    err,
-                )
+        if self._use_endpoint_power:
+            await self._switch_endpoint_power("OFF")
+            return
 
         await self.coordinator.api.change_light_state(
             self._device["homeId"], self._device["nodeId"], {"power": "OFF"}
         )
-        self._optimistic_update_all_light_endpoints("OFF")
+        for endpoint_id in _light_endpoint_ids(self._device):
+            self.coordinator.update_endpoint_power(self.node_id, endpoint_id, "OFF")
         self.coordinator.update_data(self.node_id, "lastReportedValue", "power", "OFF")
-
-    def _optimistic_update_all_light_endpoints(self, power: str) -> None:
-        for endpoint_id in self._light_endpoint_ids():
-            self.coordinator.update_endpoint_power(self.node_id, endpoint_id, power)
 
     @property
     def brightness(self) -> Optional[int]:
@@ -301,31 +277,15 @@ def _light_endpoint_ids(device: dict[str, Any]) -> list[int]:
     return endpoint_ids
 
 
-def _device_supports_channel_power(device: dict[str, Any]) -> bool:
-    """Return True when per-channel power switching is available."""
-    if device.get("supportsChannelPower"):
-        return True
-    capabilities = _capabilities_set(device)
-    return bool(
-        {
-            "switch_channel1_electrical_power",
-            "switch_channel2_electrical_power",
-        }
-        & capabilities
-    )
-
-
-def _power_channel_for_endpoint(device: dict[str, Any], endpoint_id: int | None) -> int | None:
-    """Map a light endpoint id to Enki power channel 1 or 2."""
+def _use_endpoint_power_switch(device: dict[str, Any], endpoint_id: int | None) -> bool:
+    """Return True when this entity should use per-endpoint power switching."""
     if endpoint_id is None:
-        return None
-    light_ids = _light_endpoint_ids(device)
-    if endpoint_id not in light_ids:
-        return None
-    channel_index = light_ids.index(endpoint_id)
-    if channel_index > 1:
-        return None
-    return channel_index + 1
+        return False
+    if endpoint_id == CEILING_FAN_MOTOR_ENDPOINT:
+        return False
+    if device.get("deviceType") == "ceiling_fans":
+        return endpoint_id in _light_endpoint_ids(device)
+    return device.get("supportsEndpointPower", False) or len(_light_endpoint_ids(device)) > 1
 
 
 def _capabilities_set(device: dict[str, Any]) -> set[str]:
